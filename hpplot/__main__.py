@@ -4,6 +4,7 @@ import re
 import serial
 import time
 from typing import AnyStr, Iterable, List, Union
+from rich.progress import Progress, Column, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn, TimeRemainingColumn, DownloadColumn
 
 
 CHAR_ENQ = b'\x05'
@@ -38,7 +39,7 @@ def escape_seq(operation: AnyStr, *args: List[Union[int, AnyStr]]):
         return b'\x1b' + b'.' + operation + b';'.join(argstrs) + b':'
 
 
-def query_buffer(port: serial.Serial):
+def query_buffer_space(port: serial.Serial):
     """Query the plotter for available buffer space. Returns number of
     available bytes.
     """
@@ -46,16 +47,13 @@ def query_buffer(port: serial.Serial):
     port.write(escape_seq('B'))
     return int(port.read_until(serial.CR))  # response is terminated with CR
 
-
-def draw_progressbar(pos: int, total: int):
-    """Draws a progress bar on the terminal"""
-    # Leave space for text
-    terminal_width = os.get_terminal_size().columns * 2 // 3
-    bar_length = terminal_width * pos // total
-    print('\rProgress: [' + bar_length * '\u2588' +
-          (terminal_width-bar_length) * '\u2591' +
-          '] ' + str(pos) + '/' + str(total) + ' bytes sent', end='\r')
-
+def query_buffer_size(port: serial.Serial):
+    """Query the plotter for available buffer size. Returns number of
+    logical bytes.
+    """
+    port.reset_input_buffer()
+    port.write(escape_seq('L'))
+    return int(port.read_until(serial.CR))  # response is terminated with CR
 
 def chunks(lst: Iterable, n: int):
     """Yield successive n-sized chunks from lst."""
@@ -92,6 +90,22 @@ def main():
     elif args.flow_control == 'dsrdtr':
         dsrdtr = True
 
+    progress = Progress(
+        TextColumn(""),
+        SpinnerColumn(),
+        TextColumn(""),
+        BarColumn(bar_width=None),
+        TextColumn(""),
+        DownloadColumn(table_column=Column(justify="right", min_width=14)),
+        TextColumn("[green]{task.fields[buffer]:>6} bytes", justify="right"),
+        TextColumn(""),
+        TimeElapsedColumn(table_column=Column(min_width=8, justify="right")),
+        TimeRemainingColumn(table_column=Column(min_width=8, justify="right")),
+        TextColumn(""),
+    )
+    progress.start()
+    plot = progress.add_task("hpplot", total=None, buffer="?")
+
     port = serial.Serial(port=args.port, baudrate=args.baud_rate, timeout=10,
                          xonxoff=xonxoff, rtscts=rtscts, dsrdtr=dsrdtr)
     with open(args.file, 'rb') as f:
@@ -127,6 +141,7 @@ def main():
     # time to boot, and flush any garbage that it may have sent
     time.sleep(1)
     port.reset_input_buffer()
+    progress.update(plot, total=len(hpgl))
 
     # Reset handshaking parameters to defaults (no handshaking)
     port.write(escape_seq('R'))
@@ -145,9 +160,16 @@ def main():
         port.write(escape_seq('I', args.block_size, CHAR_ENQ, CHAR_ACK))
 
     pos = 0
+    buffer_space = 0
+    buffer_size = query_buffer_size(port) if args.flow_control == 'query' else 0
     try:
-        draw_progressbar(pos, len(hpgl))
+
         for block in chunks(hpgl, args.block_size):
+            port.write(block)
+            port.flush()
+            time.sleep(0.1)
+            pos += len(block)
+
             if args.flow_control == 'enqack':
                 # ENQ/ACK flow control - send ENQ (0x05) before block, wait for
                 # ACK (0x06) response
@@ -157,14 +179,21 @@ def main():
             elif args.flow_control == 'query':
                 # No flow control - query for available buffer size, only send
                 # block once space is available.
-                while query_buffer(port) < len(block):
+                while (buffer_space := query_buffer_space(port)) < len(block):
+                    progress.update(plot, completed=pos - buffer_size + buffer_space, buffer=buffer_size - buffer_space)
                     time.sleep(0.1)
 
-            port.write(block)
-            pos += len(block)
+            progress.update(plot, completed=pos - buffer_size + buffer_space, buffer=buffer_size - buffer_space)
 
-            draw_progressbar(pos, len(hpgl))
+        if args.flow_control == 'query':
+            while (buffer_space := query_buffer_space(port)) < buffer_size:
+                progress.update(plot, completed=pos - buffer_size + buffer_space, buffer=buffer_size - buffer_space)
+                time.sleep(0.1)
+
+            progress.update(plot, completed=pos - buffer_size + buffer_space, buffer=buffer_size - buffer_space)       
+
     except KeyboardInterrupt:
+        progress.stop()
         print()
         print("Plot cancelled")
         port.reset_output_buffer()
@@ -175,9 +204,14 @@ def main():
         if not args.no_pen_select:
             port.write(b';SP0;')
         port.write(b'PU0,0;IN;')
+        port.flush()
+        time.sleep(0.1)
     finally:
+        progress.stop()
         # Reset plotter handshake config
         port.write(escape_seq('R'))
+        port.flush()
+        time.sleep(0.1)
         port.close()
     print()
 
