@@ -162,35 +162,37 @@ def main():
     pos = 0
     buffer_space = 0
     buffer_size = query_buffer_size(port) if args.flow_control == 'query' else 0
+    update_progress = lambda: progress.update(plot, completed=pos - buffer_size + buffer_space, buffer=buffer_size - buffer_space)
     try:
 
         for block in chunks(hpgl, args.block_size):
-            port.write(block)
-            port.flush()
-            time.sleep(0.1)
-            pos += len(block)
 
             if args.flow_control == 'enqack':
                 # ENQ/ACK flow control - send ENQ (0x05) before block, wait for
                 # ACK (0x06) response
                 port.write(CHAR_ENQ)
+                port.flush()
                 while port.read(1) != CHAR_ACK:
                     time.sleep(0.1)
             elif args.flow_control == 'query':
                 # No flow control - query for available buffer size, only send
                 # block once space is available.
                 while (buffer_space := query_buffer_space(port)) < len(block):
-                    progress.update(plot, completed=pos - buffer_size + buffer_space, buffer=buffer_size - buffer_space)
+                    update_progress()
                     time.sleep(0.1)
 
-            progress.update(plot, completed=pos - buffer_size + buffer_space, buffer=buffer_size - buffer_space)
+            port.write(block)
+            port.flush()
+            pos += len(block)
+            update_progress()
+            time.sleep(0.1)
 
         if args.flow_control == 'query':
             while (buffer_space := query_buffer_space(port)) < buffer_size:
-                progress.update(plot, completed=pos - buffer_size + buffer_space, buffer=buffer_size - buffer_space)
+                update_progress()
                 time.sleep(0.1)
 
-            progress.update(plot, completed=pos - buffer_size + buffer_space, buffer=buffer_size - buffer_space)       
+            update_progress()
 
     except KeyboardInterrupt:
         progress.stop()
